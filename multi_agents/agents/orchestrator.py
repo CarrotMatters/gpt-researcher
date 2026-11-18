@@ -5,6 +5,7 @@ from langgraph.graph import StateGraph, END
 # from langgraph.checkpoint.memory import MemorySaver
 from .utils.views import print_agent_output
 from ..memory.research import ResearchState
+from ..memory.section_checkpoint import SectionCheckpoint
 from .utils.utils import sanitize_filename
 from .plan_review import (
     DEFAULT_MAX_PLAN_REVISIONS,
@@ -62,13 +63,21 @@ class ChiefEditorAgent:
             "visualizer": VisualizerAgent(self.websocket, self.stream_output, self.headers)
         }
 
-    def _create_workflow(self, agents):
+    def _create_workflow(self, agents, *, checkpoint=None, resume=False):
         workflow = StateGraph(ResearchState)
 
         # Add nodes for each agent
         workflow.add_node("browser", agents["research"].run_initial_research)
         workflow.add_node("planner", agents["editor"].plan_research)
-        workflow.add_node("researcher", agents["editor"].run_parallel_research)
+        run_research = agents["editor"].run_parallel_research
+        if checkpoint is not None:
+            async def run_checkpointed_research(state):
+                checkpoint.save_plan(state)
+                return await run_research(state, checkpoint=checkpoint)
+
+            workflow.add_node("researcher", run_checkpointed_research)
+        else:
+            workflow.add_node("researcher", run_research)
         workflow.add_node("writer", agents["writer"].run)
         workflow.add_node("fact_checker", agents["fact_checker"].run)
         workflow.add_node("visualizer", agents["visualizer"].run)
@@ -76,17 +85,17 @@ class ChiefEditorAgent:
         workflow.add_node("human", agents["human"].review_plan)
 
         # Add edges
-        self._add_workflow_edges(workflow)
+        self._add_workflow_edges(workflow, entry_point="researcher" if resume else "browser")
 
         return workflow
 
-    def _add_workflow_edges(self, workflow):
+    def _add_workflow_edges(self, workflow, *, entry_point="browser"):
         workflow.add_edge('browser', 'planner')
         workflow.add_edge('planner', 'human')
         workflow.add_edge('researcher', 'writer')
         workflow.add_edge('writer', 'fact_checker')
         workflow.add_edge('visualizer', 'publisher')
-        workflow.set_entry_point("browser")
+        workflow.set_entry_point(entry_point)
         workflow.add_edge('publisher', END)
 
         # Human loop: exact "no" approval (human agent) + bounded plan revisions
@@ -146,17 +155,28 @@ class ChiefEditorAgent:
         else:
             print_agent_output(message, "MASTER")
 
-    async def run_research_task(self, task_id=None):
+    async def run_research_task(self, task_id=None, *, checkpoint_path=None):
         """
         Run a research task with the initialized research team.
 
         Args:
             task_id (optional): The ID of the task to run.
+            checkpoint_path (optional): Local SQLite file for section recovery.
 
         Returns:
             The result of the research task.
         """
-        research_team = self.init_research_team()
+        inputs = {"task": self.task}
+        if checkpoint_path is None:
+            research_team = self.init_research_team()
+        else:
+            checkpoint = SectionCheckpoint(checkpoint_path, self.task, self.tone, self.headers)
+            plan = checkpoint.load_plan()
+            if plan is not None:
+                inputs.update(plan)
+            research_team = self._create_workflow(
+                self._initialize_agents(), checkpoint=checkpoint, resume=plan is not None
+            )
         chain = research_team.compile()
 
         await self._log_research_start()
@@ -168,5 +188,5 @@ class ChiefEditorAgent:
             }
         }
 
-        result = await chain.ainvoke({"task": self.task}, config=config)
+        result = await chain.ainvoke(inputs, config=config)
         return result

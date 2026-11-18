@@ -1,4 +1,5 @@
 from dotenv import load_dotenv
+import argparse
 import sys
 import os
 import uuid
@@ -78,13 +79,17 @@ async def run_research_task(query, websocket=None, stream_output=None, tone=Tone
 
     return research_report
 
-async def main():
+async def main(*, checkpoint_path=None):
     task = open_task()
 
     chief_editor = ChiefEditorAgent(task)
-    research_report = await chief_editor.run_research_task(task_id=uuid.uuid4())
+    research_report = await chief_editor.run_research_task(
+        task_id=uuid.uuid4(), checkpoint_path=checkpoint_path
+    )
 
     return research_report
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Run a multi-agent research task.")
+    parser.add_argument("--checkpoint", help="Local SQLite file for section recovery")
+    asyncio.run(main(checkpoint_path=parser.parse_args().checkpoint))

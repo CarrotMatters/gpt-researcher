@@ -34,6 +34,14 @@ class PublisherAgent:
                 sections.append(f"{subheader}")
 
         sections_text = "\n\n".join(sections)
+        failed_sections = research_state.get("failed_sections") or []
+        failure_notice = ""
+        if failed_sections:
+            failed_list = "\n".join(f"- {section}" for section in failed_sections)
+            failure_notice = (
+                "## Incomplete report\n\n"
+                f"The following sections could not be completed:\n\n{failed_list}\n\n"
+            )
         sources = research_state.get("sources") or []
         if not isinstance(sources, (list, tuple)):
             sources = [sources] if sources else []
@@ -54,7 +62,7 @@ class PublisherAgent:
         layout = f"""# {headers.get('title')}
 #### {headers.get("date")}: {research_state.get('date')}
 
-## {headers.get("introduction")}
+{failure_notice}## {headers.get("introduction")}
 {research_state.get('introduction')}
 
 ## {headers.get("table_of_contents")}

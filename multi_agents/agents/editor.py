@@ -1,5 +1,6 @@
 from datetime import datetime
 import asyncio
+import logging
 from typing import Dict, List, Optional
 
 from langgraph.graph import StateGraph, END
@@ -7,12 +8,15 @@ from langgraph.graph import StateGraph, END
 from .utils.views import print_agent_output
 from .utils.llms import call_model
 from ..memory.draft import DraftState
+from ..memory.section_checkpoint import has_section_draft
 from . import ResearchAgent, ReviewerAgent, ReviserAgent
 from .draft_review import (
     DEFAULT_MAX_DRAFT_REVISIONS,
     MaxDraftRevisionsExceededError,
     route_draft_review,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class EditorAgent:
@@ -54,14 +58,8 @@ class EditorAgent:
             "sections": plan.get("sections"),
         }
 
-    async def run_parallel_research(self, research_state: Dict[str, any]) -> Dict[str, List[str]]:
-        """
-        Execute parallel research tasks for each section.
-
-        :param research_state: Dictionary containing research state information
-        :return: Dictionary with research results
-        """
-        agents = self._initialize_agents()
+    async def run_parallel_research(self, research_state: Dict[str, any], *, checkpoint=None) -> dict:
+        """Research sections concurrently and report which drafts could not be produced."""
         workflow = self._create_workflow()
         chain = workflow.compile()
 
@@ -69,17 +67,40 @@ class EditorAgent:
         title = research_state.get("title")
 
         self._log_parallel_research(queries)
+        completed = checkpoint.completed_drafts(len(queries)) if checkpoint else {}
 
-        final_drafts = [
-            chain.ainvoke(self._create_task_input(
-                research_state, query, title, queries), config={"tags": ["gpt-researcher"]})
-            for query in queries
-        ]
-        research_results = [
-            result["draft"] for result in await asyncio.gather(*final_drafts)
-        ]
+        async def research_section(position, query):
+            if position in completed:
+                return completed[position]
+            try:
+                result = await chain.ainvoke(
+                    self._create_task_input(research_state, query, title, queries),
+                    config={"tags": ["gpt-researcher"]},
+                )
+                draft = result.get("draft")
+            except Exception as error:
+                # Some LangGraph versions wrap a node's CancelledError.
+                if isinstance(error.__cause__, asyncio.CancelledError):
+                    raise
+                logger.warning("Research workflow failed for section %r", query, exc_info=True)
+                draft = None
+            return checkpoint.record_result(position, draft) if checkpoint else draft
 
-        return {"research_data": research_results}
+        drafts = await asyncio.gather(
+            *(research_section(position, query) for position, query in enumerate(queries))
+        )
+        research_results = []
+        failed_sections = []
+        for query, draft in zip(queries, drafts):
+            if has_section_draft(draft):
+                research_results.append(draft)
+            else:
+                failed_sections.append(query)
+
+        if failed_sections and not research_results:
+            raise RuntimeError("All report sections failed: " + ", ".join(failed_sections))
+
+        return {"research_data": research_results, "failed_sections": failed_sections}
 
     def _create_planning_prompt(self, initial_research: str, include_human_feedback: bool,
                                 human_feedback: Optional[str], max_sections: int) -> List[Dict[str, str]]:

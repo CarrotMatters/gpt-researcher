@@ -7,6 +7,7 @@ class ResearchState(TypedDict):
     initial_research: str
     sections: List[str]
     research_data: List[dict]
+    failed_sections: List[str]
     human_feedback: str
     plan_revision_count: int
     # Report layout
